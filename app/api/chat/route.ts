@@ -2,8 +2,7 @@ import { DataAPIClient } from "@datastax/astra-db-ts";
 import { HuggingFaceTransformersEmbeddings } from "@langchain/community/embeddings/huggingface_transformers";
 import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
 import { HumanMessage, AIMessage, SystemMessage } from "@langchain/core/messages";
-import { toUIMessageStream } from "@ai-sdk/langchain";
-import { createUIMessageStreamResponse } from "ai";
+import { createUIMessageStream, createUIMessageStreamResponse } from "ai";
 import "dotenv/config";
 
 const {
@@ -14,36 +13,19 @@ const {
   GOOGLE_API_KEY,
 } = process.env;
 
-// ----------------------------------------
-// Gemini
-// ----------------------------------------
-
 const llm = new ChatGoogleGenerativeAI({
   model: "gemini-3.6-flash",
   apiKey: GOOGLE_API_KEY,
 });
 
-// ----------------------------------------
-// Astra DB
-// ----------------------------------------
-
 const client = new DataAPIClient(ASTRA_DB_APPLICATION_TOKEN);
-
 const db = client.db(ASTRA_DB_API_ENDPOINT, {
   namespace: ASTRA_DB_NAMESPACE,
 });
 
-// ----------------------------------------
-// Same embedding model used during ingestion
-// ----------------------------------------
-
 const embeddings = new HuggingFaceTransformersEmbeddings({
   model: "Xenova/all-MiniLM-L6-v2",
 });
-
-// ----------------------------------------
-// Helpers: v5 UIMessage -> plain text / LangChain messages
-// ----------------------------------------
 
 type UIPart = { type: string; text?: string };
 type UIMessage = { role: string; parts: UIPart[] };
@@ -62,53 +44,33 @@ const toLangChainMessages = (messages: UIMessage[]) =>
     return new SystemMessage(text);
   });
 
-// ----------------------------------------
-// POST /api/chat
-// ----------------------------------------
-
 export async function POST(req: Request) {
   try {
     const { messages }: { messages: UIMessage[] } = await req.json();
 
-    const latestMessage = extractText(messages?.[messages.length - 1] ?? { role: "user", parts: [] });
+    const latestMessage = extractText(
+      messages?.[messages.length - 1] ?? { role: "user", parts: [] },
+    );
 
     if (!latestMessage) {
       return new Response("No message provided", { status: 400 });
     }
 
-    // ----------------------------------------
-    // 1. Convert question into embedding
-    // ----------------------------------------
-
     const queryVector = await embeddings.embedQuery(latestMessage);
 
-    // ----------------------------------------
-    // 2. Search Astra DB for similar chunks
-    // ----------------------------------------
-
     let docContext = "";
-
     try {
       const collection = db.collection(ASTRA_DB_COLLECTION as string);
-
       const cursor = collection.find(
         {},
-        {
-          sort: { $vector: queryVector },
-          limit: 10,
-        },
+        { sort: { $vector: queryVector }, limit: 10 },
       );
-
       const documents = await cursor.toArray();
       docContext = documents.map((doc) => doc.text).join("\n\n");
     } catch (error) {
       console.error("Error querying Astra DB:", error);
       docContext = "";
     }
-
-    // ----------------------------------------
-    // 3. Create RAG system message
-    // ----------------------------------------
 
     const systemMessage = `
 You are an AI assistant who knows about Formula One racing.
@@ -139,24 +101,29 @@ END CONTEXT
 ----------------
 `;
 
-    // ----------------------------------------
-    // 4. Build the LangChain message list
-    // ----------------------------------------
-
     const chatMessages = [
       new SystemMessage(systemMessage),
       ...toLangChainMessages(messages),
     ];
 
-    // ----------------------------------------
-    // 5. Ask Gemini and stream back in the AI SDK v5 UI message protocol
-    // ----------------------------------------
+    const langchainStream = await llm.stream(chatMessages);
 
-    const stream = await llm.stream(chatMessages);
+    const uiStream = createUIMessageStream({
+      execute: async ({ writer }) => {
+        const textId = crypto.randomUUID();
+        writer.write({ type: "text-start", id: textId });
 
-    return createUIMessageStreamResponse({
-      stream: toUIMessageStream(stream),
+        for await (const chunk of langchainStream) {
+          if (typeof chunk.content === "string" && chunk.content.length > 0) {
+            writer.write({ type: "text-delta", id: textId, delta: chunk.content });
+          }
+        }
+
+        writer.write({ type: "text-end", id: textId });
+      },
     });
+
+    return createUIMessageStreamResponse({ stream: uiStream });
   } catch (error) {
     console.error("Chat API error:", error);
     return new Response("Internal Server Error", { status: 500 });
