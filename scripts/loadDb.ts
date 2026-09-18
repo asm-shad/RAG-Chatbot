@@ -1,7 +1,6 @@
 import { DataAPIClient } from "@datastax/astra-db-ts";
+import { GoogleGenAI } from "@google/genai";
 import { PuppeteerWebBaseLoader } from "@langchain/community/document_loaders/web/puppeteer";
-import { HuggingFaceTransformersEmbeddings } from "@langchain/community/embeddings/huggingface_transformers";
-import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
 import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
 import "dotenv/config";
 
@@ -18,13 +17,38 @@ const {
 } = process.env;
 
 // ============================================================
-// Gemini LLM
+// Validate environment variables
 // ============================================================
 
-const llm = new ChatGoogleGenerativeAI({
-  model: "gemini-3.6-flash",
+if (
+  !ASTRA_DB_NAMESPACE ||
+  !ASTRA_DB_COLLECTION ||
+  !ASTRA_DB_API_ENDPOINT ||
+  !ASTRA_DB_APPLICATION_TOKEN ||
+  !GOOGLE_API_KEY
+) {
+  throw new Error(
+    "Missing required environment variables. Check your .env file.",
+  );
+}
+
+// ============================================================
+// Google Gemini
+// ============================================================
+
+const googleAI = new GoogleGenAI({
   apiKey: GOOGLE_API_KEY,
 });
+
+// ============================================================
+// Gemini Embedding configuration
+// ============================================================
+
+const EMBEDDING_MODEL = "gemini-embedding-001";
+
+// We intentionally use 768 dimensions.
+// The same dimension MUST be used in route.ts.
+const EMBEDDING_DIMENSION = 768;
 
 // ============================================================
 // F1 data sources
@@ -64,45 +88,87 @@ const splitter = new RecursiveCharacterTextSplitter({
 });
 
 // ============================================================
-// Hugging Face embeddings
+// Generate Gemini embedding
 // ============================================================
 
-const embeddings = new HuggingFaceTransformersEmbeddings({
-  model: "Xenova/all-MiniLM-L6-v2",
-});
-
-// all-MiniLM-L6-v2 produces 384-dimensional vectors
-const EMBEDDING_DIMENSION = 384;
-
-// ============================================================
-// Similarity metric
-// ============================================================
-
-type SimilarityMetric = "dot_product" | "cosine" | "euclidean";
-
-// ============================================================
-// Create Astra DB collection
-// ============================================================
-
-const createCollection = async (
-  similarityMetric: SimilarityMetric = "dot_product",
-) => {
-  const res = await db.createCollection(ASTRA_DB_COLLECTION, {
-    vector: {
-      dimension: EMBEDDING_DIMENSION,
-      metric: similarityMetric,
+const generateEmbedding = async (text: string): Promise<number[]> => {
+  const result = await googleAI.models.embedContent({
+    model: EMBEDDING_MODEL,
+    contents: text,
+    config: {
+      outputDimensionality: EMBEDDING_DIMENSION,
     },
   });
 
-  console.log("Collection created:", res);
+  const vector = result.embeddings?.[0]?.values;
+
+  if (!vector) {
+    throw new Error("Failed to generate Gemini embedding.");
+  }
+
+  if (vector.length !== EMBEDDING_DIMENSION) {
+    throw new Error(
+      `Unexpected embedding dimension. Expected ${EMBEDDING_DIMENSION}, got ${vector.length}.`,
+    );
+  }
+
+  return vector;
+};
+
+// ============================================================
+// Recreate Astra DB collection
+// ============================================================
+
+const recreateCollection = async () => {
+  console.log("============================================");
+  console.log("Recreating Astra DB collection");
+  console.log("============================================");
+
+  console.log(`Collection: ${ASTRA_DB_COLLECTION}`);
+  console.log(`Embedding model: ${EMBEDDING_MODEL}`);
+  console.log(`Embedding dimension: ${EMBEDDING_DIMENSION}`);
+  console.log("Similarity metric: cosine");
+
+  // ----------------------------------------------------------
+  // Delete existing collection
+  // ----------------------------------------------------------
+
+  try {
+    console.log("\nDeleting existing collection...");
+
+    await db.dropCollection(ASTRA_DB_COLLECTION);
+
+    console.log("Old collection deleted successfully.");
+  } catch (error) {
+    console.log(
+      "Collection did not exist or could not be deleted. Continuing...",
+    );
+    console.error(error);
+  }
+
+  // ----------------------------------------------------------
+  // Create new collection
+  // ----------------------------------------------------------
+
+  console.log("\nCreating new collection...");
+
+  const collection = await db.createCollection(ASTRA_DB_COLLECTION, {
+    vector: {
+      dimension: EMBEDDING_DIMENSION,
+      metric: "cosine",
+    },
+  });
+
+  console.log("New collection created successfully.");
+  console.log(collection);
 };
 
 // ============================================================
 // Scrape webpage
 // ============================================================
 
-const scrapePage = async (url: string) => {
-  console.log(`Scraping: ${url}`);
+const scrapePage = async (url: string): Promise<string> => {
+  console.log(`\nScraping: ${url}`);
 
   const loader = new PuppeteerWebBaseLoader(url, {
     launchOptions: {
@@ -135,37 +201,70 @@ const scrapePage = async (url: string) => {
 const loadSampleData = async () => {
   const collection = db.collection(ASTRA_DB_COLLECTION);
 
+  let totalChunks = 0;
+
   for (const url of rag_chatbot) {
     try {
+      console.log("\n============================================");
+      console.log(`Processing: ${url}`);
+      console.log("============================================");
+
+      // --------------------------------------------------------
+      // Scrape webpage
+      // --------------------------------------------------------
+
       const content = await scrapePage(url);
 
       console.log(`Content length: ${content.length}`);
 
+      if (!content) {
+        console.log("No content found. Skipping...");
+        continue;
+      }
+
+      // --------------------------------------------------------
       // Split webpage into chunks
+      // --------------------------------------------------------
+
       const chunks = await splitter.splitText(content);
 
       console.log(`Created ${chunks.length} chunks`);
 
-      for (const chunk of chunks) {
-        // Generate embedding using Hugging Face
-        const vector = await embeddings.embedQuery(chunk);
+      // --------------------------------------------------------
+      // Generate embeddings and insert into Astra DB
+      // --------------------------------------------------------
 
-        // Store vector + text in Astra DB
+      for (let i = 0; i < chunks.length; i++) {
+        const chunk = chunks[i];
+
+        console.log(`Embedding chunk ${i + 1}/${chunks.length}...`);
+
+        const vector = await generateEmbedding(chunk);
+
         const res = await collection.insertOne({
           $vector: vector,
           text: chunk,
           source: url,
         });
 
-        console.log(`Inserted chunk: ${res.insertedId}`);
+        totalChunks++;
+
+        console.log(
+          `Inserted chunk ${i + 1}/${chunks.length} - ID: ${res.insertedId}`,
+        );
       }
 
       console.log(`Finished: ${url}`);
     } catch (error) {
-      console.error(`Failed to process: ${url}`);
+      console.error(`\nFailed to process: ${url}`);
       console.error(error);
     }
   }
+
+  console.log("\n============================================");
+  console.log("Ingestion completed");
+  console.log("============================================");
+  console.log(`Total chunks inserted: ${totalChunks}`);
 };
 
 // ============================================================
@@ -174,13 +273,16 @@ const loadSampleData = async () => {
 
 const main = async () => {
   try {
-    await createCollection();
+    await recreateCollection();
 
     await loadSampleData();
 
-    console.log("F1 data ingestion completed.");
+    console.log("\nF1 data ingestion completed successfully.");
   } catch (error) {
-    console.error("Error:", error);
+    console.error("\nError during ingestion:");
+    console.error(error);
+
+    process.exit(1);
   }
 };
 
