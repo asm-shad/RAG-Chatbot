@@ -6,7 +6,9 @@ Users can ask questions about F1 drivers, championships, teams, races, history, 
 
 ## 🚀 Live Demo
 
-> Add your Vercel deployment URL here.
+Try F1GPT here:
+
+**https://formula1race.vercel.app/**
 
 ---
 
