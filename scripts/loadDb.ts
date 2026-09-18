@@ -1,8 +1,8 @@
 import { DataAPIClient } from "@datastax/astra-db-ts";
 import { PuppeteerWebBaseLoader } from "@langchain/community/document_loaders/web/puppeteer";
 import { HuggingFaceTransformersEmbeddings } from "@langchain/community/embeddings/huggingface_transformers";
-import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
 import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
+import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
 import "dotenv/config";
 
 // ============================================================
@@ -78,10 +78,7 @@ const EMBEDDING_DIMENSION = 384;
 // Similarity metric
 // ============================================================
 
-type SimilarityMetric =
-  | "dot_product"
-  | "cosine"
-  | "euclidean";
+type SimilarityMetric = "dot_product" | "cosine" | "euclidean";
 
 // ============================================================
 // Create Astra DB collection
@@ -123,9 +120,7 @@ const scrapePage = async (url: string) => {
 
   const docs = await loader.load();
 
-  const content = docs
-    .map((doc) => doc.pageContent)
-    .join("\n");
+  const content = docs.map((doc) => doc.pageContent).join("\n");
 
   // Remove HTML tags
   const cleanContent = content.replace(/<[^>]*>/g, " ");
